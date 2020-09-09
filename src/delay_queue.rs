@@ -42,6 +42,7 @@ pub struct DelayQueue<T> {
     slab: Slab<T>,
     heap: BinaryHeap<Reverse<Entry>>,
     task: Option<task::Task>,
+    min_sleep_duration: Duration,
 }
 
 impl<T> DelayQueue<T> {
@@ -55,7 +56,12 @@ impl<T> DelayQueue<T> {
             heap: BinaryHeap::new(),
             slab: Slab::new(),
             task: None,
+            min_sleep_duration: Duration::from_secs(0),
         })
+    }
+
+    pub fn set_min_sleep_duration(&mut self, value: Duration) {
+        self.min_sleep_duration = value;
     }
 
     fn poll_next(&mut self) -> Result<Async<Option<Expired<T>>>, IoError> {
@@ -63,24 +69,28 @@ impl<T> DelayQueue<T> {
         if let Some(item) = self.heap.peek() {
             if item.0.expiration > now {
                 let duration = item.0.expiration - now;
-                self.timerfd
-                    .set_state(TimerState::Oneshot(duration), SetTimeFlags::Default);
-            } else {
-                let item = self.heap.pop().unwrap();
-                let data = self.slab.remove(item.0.index);
-
-                if let Some(task) = &self.task {
-                    task.notify();
+                if duration > self.min_sleep_duration {
+                    self.timerfd
+                        .set_state(TimerState::Oneshot(duration), SetTimeFlags::Default);
+                    return Ok(Async::NotReady);
                 }
+                while item.0.expiration > Instant::now() {}
+            }
+            let item = self.heap.pop().unwrap();
+            let data = self.slab.remove(item.0.index);
 
-                return Ok(Async::Ready(Some(Expired {
-                    data,
-                    deadline: item.0.expiration,
-                    key: Key(item.0.index),
-                })));
-            };
+            if let Some(task) = &self.task {
+                task.notify();
+            }
+
+            Ok(Async::Ready(Some(Expired {
+                data,
+                deadline: item.0.expiration,
+                key: Key(item.0.index),
+            })))
+        } else {
+            Ok(Async::NotReady)
         }
-        Ok(Async::NotReady)
     }
 
     /// Insert `value` into the queue set to expire at a specific instant in
